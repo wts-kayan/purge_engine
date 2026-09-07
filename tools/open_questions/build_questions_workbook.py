@@ -1,0 +1,232 @@
+#!/usr/bin/env python3
+"""
+Turn an OPEN_QUESTIONS CSV into a workbook the business can actually read and answer in.
+
+The CSV stays the source of truth (it diffs cleanly in git); the workbook is DERIVED and
+regenerated whenever the CSV changes - which it will, as answers come back. Doing the
+formatting by hand each time is the thing this script exists to avoid.
+
+Works on any CSV carrying the 11-column schema of `docs/tseadfwd/OPEN_QUESTIONS.csv`
+(';' delimited, quoted, UTF-8 BOM), so it serves both that file and the per-ticket ones.
+
+    python tools/open_questions/build_questions_workbook.py \
+        --csv docs/tseadfwd/977/OPEN_QUESTIONS_977.csv \
+        --out docs/tseadfwd/977/OPEN_QUESTIONS_977.xlsx \
+        --title "Ticket 977 - RA input comparison report"
+
+Adds one column the CSV does not have: BUSINESS ANSWER, left empty and highlighted, so the
+reply lands in a column of its own instead of overwriting the analysis. Feed answers back into
+the CSV's "Decision so far / answer" column once they are agreed.
+"""
+
+import argparse
+import csv
+import io
+import os
+
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.utils import get_column_letter
+
+# ------------------------------------------------------------------ palette
+# Muted, print-safe, and legible next to the black body text.
+INK = "1C1C1C"
+HEAD_BG = "2F3B45"
+HEAD_FG = "FFFFFF"
+ANSWER_BG = "FFF6D8"   # the column the business fills in
+ANSWER_HD = "8A6D1F"
+BAND = "F5F7F9"        # zebra banding
+LINE = "D9DEE3"
+PRIORITY_FILL = {
+    "High":   "F8D7DA",
+    "Medium": "FFF0CC",
+    "Low":    "E8ECEF",
+}
+STATUS_FILL = {
+    "Open":       "FDECEA",
+    "Answered":   "E6F4EA",
+    "Resolved":   "E6F4EA",
+    "Superseded": "ECEFF1",
+    "Blocked":    "FDECEA",
+}
+
+ANSWER_COL = "BUSINESS ANSWER"
+
+# width in characters, and whether the cell wraps
+COLUMN_LAYOUT = {
+    "ID":                             (7,   False),
+    "Area":                           (16,  True),
+    "Question":                       (40,  True),
+    "Description":                    (95,  True),
+    "Status":                         (12,  False),
+    "Engine behaviour today":         (42,  True),
+    "What we need from the business": (46,  True),
+    "Decision so far / answer":       (40,  True),
+    "Needs business input":           (11,  True),
+    "Priority":                       (10,  False),
+    "Related":                        (16,  True),
+    ANSWER_COL:                       (40,  True),
+}
+DEFAULT_LAYOUT = (24, True)
+
+thin = Side(style="thin", color=LINE)
+BORDER = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+
+def read_rows(path):
+    with io.open(path, encoding="utf-8-sig", newline="") as f:
+        rows = list(csv.reader(f, delimiter=";"))
+    rows = [r for r in rows if any(c.strip() for c in r)]
+    if not rows:
+        raise SystemExit("empty CSV: " + path)
+    return rows[0], rows[1:]
+
+
+def estimate_height(record, header, widths):
+    """Row height in points. openpyxl cannot auto-fit, and the Description column runs to
+    ~1200 characters - left at the default height every long row is clipped to one line."""
+    lines = 1
+    for name, value in zip(header, record):
+        width, wrap = COLUMN_LAYOUT.get(name, DEFAULT_LAYOUT)
+        if not wrap or not value:
+            continue
+        # ~0.95 chars per width unit once the font is applied, plus explicit newlines
+        est = int(len(value) / max(width * 0.95, 1)) + 1
+        lines = max(lines, est)
+    return min(max(lines * 12.6, 16), 409)  # 409 is Excel's per-row maximum
+
+
+def build(csv_path, out_path, title, add_answer_column):
+    header, records = read_rows(csv_path)
+    columns = list(header) + ([ANSWER_COL] if add_answer_column else [])
+
+    wb = Workbook()
+
+    # ---------------------------------------------------------------- INFO
+    # Named to match the COMPARE INFO sheet of this ticket's reference workbook.
+    info = wb.active
+    info.title = "INFO"
+    info.sheet_view.showGridLines = False
+    info.column_dimensions["A"].width = 30
+    info.column_dimensions["B"].width = 104
+
+    counts = {}
+    prio = {}
+    for r in records:
+        row = dict(zip(header, r))
+        counts[row.get("Status", "")] = counts.get(row.get("Status", ""), 0) + 1
+        prio[row.get("Priority", "")] = prio.get(row.get("Priority", ""), 0) + 1
+
+    def order(d, keys):
+        seen = [k for k in keys if k in d] + [k for k in d if k not in keys]
+        return ", ".join("%s %d" % (k or "(blank)", d[k]) for k in seen)
+
+    info_rows = [
+        (title, ""),
+        ("", ""),
+        ("Questions", str(len(records))),
+        ("By status", order(counts, ["Open", "Blocked", "Answered", "Resolved", "Superseded"])),
+        ("By priority", order(prio, ["High", "Medium", "Low"])),
+        ("", ""),
+        ("Source (authoritative)", csv_path.replace("\\", "/")),
+        ("Generated by", "tools/open_questions/build_questions_workbook.py"),
+        ("", ""),
+        ("How to use", "Answer in the yellow BUSINESS ANSWER column, one row per question."
+                       " Leave the other columns as they are - they record what the engine does"
+                       " today and why the question is being asked."),
+        ("", "The CSV is the source of truth and is what gets updated once an answer is agreed;"
+             " this workbook is regenerated from it, so edits made here are not carried back"
+             " automatically."),
+        ("", ""),
+        ("Priority", "High - blocks the build, or changes a number the business signs off."),
+        ("", "Medium - changes the report but a default is in place."),
+        ("", "Low - cosmetic or naming."),
+    ]
+    for i, (k, v) in enumerate(info_rows, start=2):
+        a = info.cell(row=i, column=1, value=k)
+        b = info.cell(row=i, column=2, value=v)
+        a.font = Font(bold=True, color=INK, size=14 if i == 2 else 11)
+        a.alignment = Alignment(vertical="top")
+        b.alignment = Alignment(vertical="top", wrap_text=True)
+        b.font = Font(color=INK)
+        if len(v) > 110:
+            info.row_dimensions[i].height = 14 * (len(v) // 110 + 1)
+
+    # ----------------------------------------------------------- Questions
+    ws = wb.create_sheet("Questions")
+    ws.sheet_view.showGridLines = False
+
+    for c, name in enumerate(columns, start=1):
+        width, _ = COLUMN_LAYOUT.get(name, DEFAULT_LAYOUT)
+        ws.column_dimensions[get_column_letter(c)].width = width
+        cell = ws.cell(row=1, column=c, value=name)
+        is_answer = name == ANSWER_COL
+        cell.font = Font(bold=True, color=HEAD_FG, size=10)
+        cell.fill = PatternFill("solid", fgColor=ANSWER_HD if is_answer else HEAD_BG)
+        cell.alignment = Alignment(vertical="center", horizontal="center", wrap_text=True)
+        cell.border = BORDER
+    ws.row_dimensions[1].height = 30
+
+    for i, record in enumerate(records):
+        r = i + 2
+        row = dict(zip(header, record))
+        banded = (i % 2 == 1)
+        for c, name in enumerate(columns, start=1):
+            value = row.get(name, "")
+            _, wrap = COLUMN_LAYOUT.get(name, DEFAULT_LAYOUT)
+            cell = ws.cell(row=r, column=c, value=value)
+            cell.alignment = Alignment(
+                vertical="top",
+                wrap_text=wrap,
+                horizontal="center" if name in ("ID", "Status", "Priority", "Needs business input") else "left",
+            )
+            cell.font = Font(color=INK, size=10, bold=(name == "ID"))
+            cell.border = BORDER
+
+            fill = None
+            if name == ANSWER_COL:
+                fill = ANSWER_BG
+            elif name == "Priority":
+                fill = PRIORITY_FILL.get(value)
+            elif name == "Status":
+                fill = STATUS_FILL.get(value)
+            elif banded:
+                fill = BAND
+            if fill:
+                cell.fill = PatternFill("solid", fgColor=fill)
+
+        ws.row_dimensions[r].height = estimate_height(record, header, COLUMN_LAYOUT)
+
+    last = get_column_letter(len(columns))
+    ws.auto_filter.ref = "A1:%s%d" % (last, len(records) + 1)
+    ws.freeze_panes = "C2"   # header row + ID/Area stay visible while reading Description
+    ws.print_title_rows = "1:1"
+
+    parent = os.path.dirname(out_path)
+    if parent:
+        try:
+            os.makedirs(parent)
+        except OSError:
+            pass
+    wb.save(out_path)
+
+    print("wrote %s" % out_path)
+    print("  questions : %d" % len(records))
+    print("  columns   : %d%s" % (len(columns), " (+ BUSINESS ANSWER)" if add_answer_column else ""))
+    print("  status    : %s" % order(counts, ["Open", "Blocked", "Answered", "Resolved", "Superseded"]))
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--csv", required=True, help="OPEN_QUESTIONS csv to convert")
+    p.add_argument("--out", required=True, help="workbook to write")
+    p.add_argument("--title", default="Open questions", help="title shown on the INFO sheet")
+    p.add_argument("--no-answer-column", action="store_true",
+                   help="do not add the empty BUSINESS ANSWER column")
+    a = p.parse_args()
+    build(a.csv, a.out, a.title, add_answer_column=not a.no_answer_column)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,27 @@
+*.class
+*.tasty
+*.log
+
+# virtual machine crash logs, see http://www.java.com/en/download/help/error_hotspot.xml
+hs_err_pid*
+
+# build & IDE
+target/
+*.iml
+/.idea/
+cp.txt
+
+# generated output
+localRun/purge/output/
+localRun/purge/output_tmp/
+localRun/purge/reports/
+localRun/run_history/
+/out/
+derby.log
+metastore_db/
+
+# Excel temp lock files
+~$*
+
+# Claude Code local agent files
+.claude/
