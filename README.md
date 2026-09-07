@@ -192,8 +192,8 @@ The manifest carries a **fingerprint** — a SHA-256 over the sorted `(path, siz
 modification_time)` triples — which the execution re-checks before touching anything.
 
 `purge_detail` is a complete account of the manifest, not a list of successes: `TRASHED`, `DELETED`,
-`PARTITION_DROPPED`, `LOGICALLY_DELETED`, `SKIPPED_BLOCKED`, `SKIPPED_ABSENT`, `SKIPPED_DRIFT`,
-`SKIPPED_ABORTED`, `FAILED`. That is what makes replaying a manifest safe, and replaying is how a
+`PARTITION_DROPPED`, `TABLE_DROPPED`, `LOGICALLY_DELETED`, `SKIPPED_BLOCKED`, `SKIPPED_ABSENT`,
+`SKIPPED_DRIFT`, `SKIPPED_ABORTED`, `FAILED`. That is what makes replaying a manifest safe, and replaying is how a
 `PARTIAL` run is finished — everything already removed comes back `SKIPPED_ABSENT`.
 
 ---
@@ -249,10 +249,12 @@ decisions, so they never share a colour.
 
 Three implementation choices inside that are not obvious:
 
-- **Trash first, drop second.** Every STR output is EXTERNAL with `external.table.purge = TRUE`, so a
-  bare `DROP PARTITION` deletes the data *through Hive*, outside this engine's deletion path and with
-  no certainty that it honours Trash. So the executor moves the data to Trash, then drops a partition
-  whose location is already empty: pure metadata, metastore consistent, 7-day window intact.
+- **Trash first, drop second.** Every STR output is EXTERNAL with `external.table.purge = TRUE` —
+  confirmed for projection and the classic simulator alike — so a bare `DROP PARTITION` or
+  `DROP TABLE` deletes the data *through Hive*, outside this engine's deletion path and with no
+  certainty that it honours Trash. So the executor moves the data to Trash, then drops a partition
+  (or, for a table-granular run, a table) whose location is already empty: pure metadata, metastore
+  consistent, 7-day window intact.
 - **Trash unavailable is a failure, not a fallback.** `moveToAppropriateTrash` returns false when
   `fs.trash.interval` is 0 and leaves the data where it is. Reporting that as success would claim a
   purge that did not happen; falling back to a hard delete would destroy the recoverability the
@@ -274,6 +276,7 @@ src/main/scala/com.bnp.str.purge/
 ├── job/            InventoryDriver · SimulationDriver · RunCatalogDriver · MainDriver
 ├── common/         RunnerProvider · PrimaryRunner · MapperProvider · PurgeOutcome
 ├── engine/         EngineRun · EngineDescriptor (+ registry) · ProjectionEngine
+│                   SimulatorClassicEngine
 ├── reader/         PrimaryReader · InventoryReader · CatalogReader · EngineRunReader
 │                   PolicyReader · RunCatalogReader · ManifestReader
 ├── mapping/        PrimaryMapper · PrimaryView (the selection SQL) · ManifestView (fingerprint)
@@ -292,8 +295,10 @@ Same layout, file names and class-name logic as `file_transform_engine`
 
 **Adding an engine** is one `EngineDescriptor`: the keys naming its run id, its outputs, its inputs,
 its history table, and its `granularity` (`PARTITION` or `TABLE`). Nothing else changes. `projection`
-is the MVP; getting granularity wrong in either direction — dropping a table where a partition was
-meant, or the reverse — is severe, so it is declared, never inferred.
+is the MVP and `simulator_classic` the first table-granular engine — where a run IS its tables rather
+than a partition of each. Getting granularity wrong in either direction — dropping a table where a
+partition was meant, or the reverse — is severe, so it is declared, never inferred, and the two
+expansions are pinned against each other by `EngineGranularitySpec`.
 
 Build: Scala 2.12.18 / Spark 3.5.4 / Hadoop 3.3.4, Java 8 target, fat jar `target/str-purge-engine.jar`.
 Spark and Hadoop are `provided`. The pom's default `mainClass` is the read-only `InventoryDriver`, but
@@ -353,14 +358,9 @@ Deliberate omissions, so nobody goes looking for them in the code:
 - **Object stores other than HDFS are out of scope** — Kudu, HBase, Solr, Impala-managed storage.
 - **No cross-cluster propagation.** A deletion here does not reach the DR cluster.
 - **No scheduling.** Every run is submitted on demand by TWIST; a scheduled mode comes later.
-- **One engine.** `projection` is the only `EngineDescriptor` in the registry. Another engine is a
-  descriptor, but it is not written yet — and each new one needs its own confirmation that everything
-  it writes is declared in its run configuration.
-- **A table-granular engine can be simulated but not executed.** A descriptor declaring
-  `granularity = TABLE` (the simulator, where a run *is* its tables) now expands, catalogues and
-  reports correctly, but `PurgeGuard` refuses the deletion: `PurgeExecutor` only knows how to drop a
-  partition, so executing one would trash the data and leave the table registered. Lifting the
-  refusal means implementing `DROP TABLE`, not deleting the check.
+- **Two engines.** `projection` and `simulator_classic` are the `EngineDescriptor`s in the registry
+  — one of each granularity. Another engine is a descriptor, but it is not written yet, and each new
+  one needs its own confirmation that everything it writes is declared in its run configuration.
 - **`PC05` and `PC07` are implemented and inert.** There is no lineage referential on Promethee yet
   (so `PC05` reports UNKNOWN until one exists) and archive is on hold and may end up outside
   Cloudera's reach. Both stay in the report rather than being deleted from it, because a control that

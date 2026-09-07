@@ -502,16 +502,17 @@ delete. It refuses the whole run — not just the offending row — when any of 
 - a target path has fewer than `MIN_PATH_DEPTH` (= 4) segments, or matches the denylist
   (`/`, `/user`, `/tmp`, `/apps`, `/warehouse`, any Hive database root, any unresolved `*`);
 - the run would delete more than `guard.maxBytes` / `guard.maxObjects` without a second approval;
-- `mode = EXECUTE` and the approval token is missing or does not match the manifest fingerprint;
-- the engine declares `granularity = TABLE`, which the executor cannot yet carry out (below).
+- `mode = EXECUTE` and the approval token is missing or does not match the manifest fingerprint.
 
-**Granularity the executor cannot honour.** `PurgeExecutor` drops a *partition*, and skips any row
-whose `partition_spec` is empty — which is every row of a table-granular scope. Executing one would
-therefore move the data to Trash and leave the table registered in the metastore against a location
-that no longer holds anything: a half-done deletion reporting SUCCESS, which is exactly the severity
-§16.Q1 warns about. So the guard refuses the execution while the **simulation stays available** —
-seeing what would go is useful and removes nothing. Lifting the refusal means teaching the executor
-`DROP TABLE` (data to Trash first, metadata second, as for a partition), not deleting the check.
+**Dropping a whole table.** A table-granular run — the classic simulator, where a run IS its tables —
+produces manifest rows whose `partition_spec` is empty and which carry `is_registered_table = true`,
+a column the selection SQL sets when a candidate's path is EXACTLY a registered table's location.
+`PurgeExecutor.maybeDropTable` then drops the table after its data has gone, the same way
+`maybeDropPartition` drops a partition, and `execution.dropHiveTable` (default `true`) switches it
+off for a perimeter that wants the data removed and the definition kept. Two safeguards sit around
+it: a row carrying a partition spec is never dropped as a table even if it claims to be one, and the
+partition drop is tried first, so the more destructive instrument is only ever reached when the less
+destructive one did not apply.
 
 This duplicates part of the controls on purpose: the controls are configurable and can be switched
 off; `PurgeGuard` cannot.
@@ -580,7 +581,7 @@ Every candidate goes through every enabled rule. A `BLOCKING` rule that fires se
 | **PC08** | `NOT_AUTHORIZED` | BLOCKING | The requester is not owner of the perimeter, or not a member of the purge group for that domain. |
 | **PC09** | `BLAST_RADIUS` | BLOCKING | The run exceeds `guard.maxBytes` / `maxObjects` / `maxPercentOfTable`. Releasable only by a second, explicit approval. |
 | **PC10** | `RECENTLY_ACCESSED` | WARNING | HDFS `atime` within `recentAccessDays`. Someone is still reading it — worth a human look, not a veto (atime is unreliable on some clusters). |
-| **PC11** | `HIVE_METADATA_ORPHAN` | WARNING | The path is a registered Hive partition: deleting the files alone would leave orphan metadata. The executor is instructed to `DROP PARTITION` as well. |
+| **PC11** | `HIVE_METADATA_ORPHAN` | WARNING | The path is a registered Hive partition, or a registered table in its own right: deleting the files alone would leave orphan metadata. The executor is instructed to `DROP PARTITION` / `DROP TABLE` as well. |
 | **PC12** | `MANIFEST_DRIFT` | BLOCKING (execute phase) | At execution the object's `(size_bytes, modification_time)` no longer matches the manifest, or the fingerprint does not match the approval token. The world changed since the simulation — abort. |
 | **PC13** | `ALREADY_ABSENT` | WARNING | The path no longer exists. Recorded `SKIPPED_ABSENT`, keeps the run idempotent. |
 | **PC14** | `SHARED_INPUT` | BLOCKING | The object is declared as an INPUT by one of the runs being purged, or is the engine's own run history — or is a directory containing one. Inputs are shared across runs and belong to none of them. |
@@ -647,8 +648,8 @@ status, bytes_freed, num_files, trash_path, restore_deadline, error_message,
 executed_at, user_launcher
 ```
 
-`status ∈ { DELETED, TRASHED, PARTITION_DROPPED, LOGICALLY_DELETED, SKIPPED_BLOCKED,
-SKIPPED_ABSENT, FAILED }`.
+`status ∈ { DELETED, TRASHED, PARTITION_DROPPED, TABLE_DROPPED, LOGICALLY_DELETED, SKIPPED_BLOCKED,
+SKIPPED_ABSENT, SKIPPED_DRIFT, SKIPPED_ABORTED, FAILED }`.
 
 ### 9.4 `run_history` — reused as-is
 
@@ -1047,10 +1048,10 @@ Concretely, in the code:
   (`EngineRun.relativePathOf` / `partitionSpecOf`, §3bis), the run catalogue's run-id recovery, and
   PC04's path token — and an unknown value is refused where the descriptor is resolved rather than
   falling through to the partition reading, which is the more destructive of the two to get wrong.
-  What is *not* implemented is the deletion: `PurgeExecutor` can only drop a partition, so
-  `PurgeGuard` refuses to execute a table-granular run and allows its simulation (§7.7). Adding the
-  simulator therefore needs its descriptor **and** `DROP TABLE` in the executor, and until the second
-  exists the first cannot silently half-work.
+  The deletion followed: `PurgeExecutor.maybeDropTable` drops a whole table once its data is in
+  Trash (§7.7), so `PurgeGuard` no longer has to refuse a table-granular run. The first engine of
+  that shape — the classic simulator — is described in
+  `docs/purge/simulator_classic_analysis.md`.
 - **Q10 — there is one partition level, not two.** The double nesting the layout screenshot hinted
   at does not exist; the inventory needs no change, since it walks to the leaf whatever the depth.
 
@@ -1085,6 +1086,12 @@ no certainty that it honours Trash. Rather than answer that question, the execut
 `TRASH` and `DROP_PARTITION` therefore take the same path. The metastore ends up consistent, the
 7-day window still applies, and the open verification item about Hive and Trash stops mattering.
 
+The same ordering, for the same reason, applies one level up. **The business confirmed on 2026-09-07
+that `external.table.purge = TRUE` holds for the projection AND the simulator tables**, so
+`DROP TABLE` would also delete data through Hive. A table-granular object is therefore trashed first
+and dropped second, and the drop is again pure metadata against an empty location. Nothing about the
+restore window changes between purging a partition and purging a table.
+
 ### Trash unavailable is a failure, not a fallback
 
 `moveToAppropriateTrash` returns false when `fs.trash.interval` is 0 and leaves the data in place.
@@ -1114,6 +1121,7 @@ reached `SKIPPED_ABORTED`. That is what makes replaying a manifest safe, and rep
 | `TRASHED` | Moved to Trash. Recoverable until `restore_deadline`. |
 | `DELETED` | Hard-deleted. Not recoverable. |
 | `PARTITION_DROPPED` | Data trashed and the Hive partition dropped. |
+| `TABLE_DROPPED` | Data trashed and the Hive table dropped — a table-granular run. |
 | `LOGICALLY_DELETED` | Recorded as purged; the data was left in place. |
 | `SKIPPED_BLOCKED` | A control blocked it, or the controls never judged it. |
 | `SKIPPED_ABSENT` | Already gone. |
@@ -1279,10 +1287,10 @@ anyone wants, and the guard is the environment rather than a flag someone could 
    `PC07` should check, or does `HARD` simply mean gone?
 7. **Managed vs external Hive tables.** Confirmed that all engine outputs are EXTERNAL with
    `external.table.purge = FALSE`? A managed table changes what `DROP PARTITION` does to the data.
-8. **Which engine after projection?** The MVP handles `projection`. Each further engine needs one
-   `EngineDescriptor` — the keys naming its run id, its outputs and its inputs — and nothing else,
-   *unless* it is table-granular, which additionally needs `DROP TABLE` in the executor (§7.7).
-   Which one is next, and does any engine write output that is NOT declared in its run configuration?
+8. **Which engine after projection and the classic simulator?** Each further engine needs one
+   `EngineDescriptor` — the keys naming its run id, its outputs and its inputs — and nothing else;
+   both granularities are now implemented end to end. Which one is next, and does any engine write
+   output that is NOT declared in its run configuration?
 9. **Double-nested run partitions.** The layout note reports a possible `runId=<uuid>/runid=<uuid>/`
    nesting under `term_structure` that the screenshot does not confirm. If it is real, the inventory
    treats the inner directory as the purge unit; worth verifying with `hdfs dfs -ls` before the first

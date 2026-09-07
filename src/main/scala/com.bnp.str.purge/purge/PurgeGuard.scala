@@ -1,6 +1,5 @@
 package com.bnp.str.purge.purge
 
-import com.bnp.str.purge.engine.EngineDescriptor
 import com.bnp.str.purge.utility.{PrimaryConstants, PrimaryUtilities}
 import com.typesafe.config.{Config, ConfigFactory}
 import org.apache.spark.sql.functions._
@@ -39,8 +38,7 @@ object PurgeGuard {
       unsafeTargets(deletable, allowedRoots) ++
         overCeilings(deletable, guardConfig) ++
         staleManifest(manifest, guardConfig) ++
-        missingApproval(manifest, conf, guardConfig) ++
-        unsupportedGranularity(engineDescriptor(conf))
+        missingApproval(manifest, conf, guardConfig)
 
     if (refusals.nonEmpty)
       throw new IllegalStateException(
@@ -143,37 +141,6 @@ object PurgeGuard {
       if (token.nonEmpty && fingerprint.nonEmpty && !token.contains(fingerprint.take(TOKEN_FINGERPRINT_CHARS)))
         Some("the approval token does not carry the fingerprint of this manifest") else None
     ).flatten
-  }
-
-  /**
-   * Refuse to EXECUTE a run of an engine whose granularity the executor cannot carry out.
-   *
-   * A table-granular run (the simulator, per Q1) IS its tables, so purging it means the tables
-   * themselves go. [[PurgeExecutor.maybeDropPartition]] only ever drops a PARTITION, and skips a row
-   * whose `partition_spec` is empty — which is every row of a table-granular scope. The run would
-   * therefore trash the data and leave the table registered in the metastore, pointing at a location
-   * that no longer holds anything: a half-done deletion that reports SUCCESS, and the exact shape of
-   * failure §16.Q1 calls severe.
-   *
-   * So the simulation of such a run is allowed — seeing what would go is useful and harms nothing —
-   * and the deletion is refused until the executor learns to drop a table. Refusing here rather than
-   * in the controls is deliberate: this is a limit of the code, not a policy someone may switch off.
-   */
-  // `private[str]`, not `private[purge]`: inside com.bnp.str.purge.purge the latter names THIS
-  // package, which the specs in com.bnp.str.purge cannot reach.
-  private[str] def unsupportedGranularity(descriptor: Option[EngineDescriptor]): Seq[String] =
-    descriptor.filter(_.isTableGranular).toSeq.map(d =>
-      s"engine '${d.name}' declares granularity ${EngineDescriptor.GRANULARITY_TABLE}, where a run " +
-        "IS its tables; the executor can only drop a partition, so executing this manifest would " +
-        "remove the data and leave the table registered. Simulation is available; execution is not " +
-        "until PurgeExecutor implements DROP TABLE.")
-
-  /** The engine this run is about, when one is configured. `None` for a path- or policy-driven run. */
-  private def engineDescriptor(conf: Config): Option[EngineDescriptor] = {
-    val engineConfig = configOf(conf, PrimaryConstants.ENGINE)
-    Some(PrimaryUtilities.getStringOr(engineConfig, "name", "").trim)
-      .filter(_.nonEmpty)
-      .map(EngineDescriptor.of)
   }
 
   // ---------------------------------------------------------------------------------------------

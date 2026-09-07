@@ -93,7 +93,7 @@ class PurgeControlMapper(checks: CheckConfig,
     sharedInput,
     noRetentionPolicy,
     recentlyAccessed,
-    hiveMetadataOrphan,
+    hiveMetadataOrphan(manifest),
     executionPhaseOnly(PurgeRule.ManifestDrift),
     executionPhaseOnly(PurgeRule.AlreadyAbsent)
   ).map(eval => if (checks.ruleEnabled(eval.rule)) eval else eval.disabled)
@@ -336,8 +336,21 @@ class PurgeControlMapper(checks: CheckConfig,
       value = Some(concat_ws(" ", lit("last read"), col("access_time").cast("string"))))
   }
 
-  /** PC11 — deleting the files alone would orphan the metastore entry. */
-  private def hiveMetadataOrphan: RuleEval =
+  /**
+   * PC11 — deleting the files alone would orphan the metastore entry.
+   *
+   * Fires for a registered partition and for a whole registered table alike: a table-granular run
+   * leaves an unreadable table behind exactly as a partition-granular one leaves an unreadable
+   * partition. The executor is instructed to drop whichever it is.
+   */
+  private def hiveMetadataOrphan(manifest: DataFrame): RuleEval =
+    if (manifest.columns.contains("is_registered_table")) RuleEval(PurgeRule.HiveMetadataOrphan,
+      condition = Some(coalesce(col("is_registered_partition"), lit(false)) === true ||
+        coalesce(col("is_registered_table"), lit(false)) === true),
+      value = Some(lit("the metastore still holds this object; the executor drops it as well")))
+    else hiveMetadataOrphanPartitionOnly
+
+  private def hiveMetadataOrphanPartitionOnly: RuleEval =
     RuleEval(PurgeRule.HiveMetadataOrphan,
       condition = Some(coalesce(col("is_registered_partition"), lit(false)) === true),
       value = Some(concat_ws(" ", lit("registered as"), col("database_name"), lit("."),

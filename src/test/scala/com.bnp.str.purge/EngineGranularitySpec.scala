@@ -1,7 +1,6 @@
 package com.bnp.str.purge
 
-import com.bnp.str.purge.engine.{EngineDescriptor, EngineRun, ProjectionEngine}
-import com.bnp.str.purge.purge.PurgeGuard
+import com.bnp.str.purge.engine.{EngineDescriptor, EngineRun, ProjectionEngine, SimulatorClassicEngine}
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 
@@ -80,17 +79,11 @@ class EngineGranularitySpec extends AnyFunSuite with Matchers with SparkTestSess
     EngineDescriptor.of("projection").granularity shouldBe EngineDescriptor.GRANULARITY_PARTITION
   }
 
-  // ---- and the deletion of what nothing can yet delete is refused --------------------------------
+  // ---- the engines that declare each granularity ------------------------------------------------
 
-  test("executing a table-granular run is refused: the executor can only drop a partition") {
-    val refusals = PurgeGuard.unsupportedGranularity(Some(TableGranularEngine))
-    refusals should have size 1
-    refusals.head should include("TABLE")
-    refusals.head should include("DROP TABLE")
-  }
-
-  test("a partition-granular engine, and a run with no engine at all, are not refused") {
-    PurgeGuard.unsupportedGranularity(Some(ProjectionEngine)) shouldBe empty
-    PurgeGuard.unsupportedGranularity(None) shouldBe empty
+  test("the registry holds one engine of each granularity, and each declares it explicitly") {
+    ProjectionEngine.granularity shouldBe EngineDescriptor.GRANULARITY_PARTITION
+    SimulatorClassicEngine.granularity shouldBe EngineDescriptor.GRANULARITY_TABLE
+    SimulatorClassicEngine.isTableGranular shouldBe true
   }
 }

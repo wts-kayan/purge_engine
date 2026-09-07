@@ -77,18 +77,16 @@ class EngineRunReader()(implicit sparkSession: SparkSession, conf: Config) {
       val byIdentity = run.tables.map(table =>
         PrimaryReader.ScopeEntry("", run.database, table, run.partitionSpecOf, businessDate))
 
-      val byPath = location.toSeq.flatMap { root =>
-        run.tables.map(table =>
-          PrimaryReader.ScopeEntry(
-            PrimaryUtilities.normalizePath(s"$root/${run.relativePathOf(table)}"), "", "",
-            "", businessDate))
+      val byPath = run.tables.flatMap { table =>
+        pathOf(run, table, location).map(path =>
+          PrimaryReader.ScopeEntry(path, "", "", "", businessDate))
       }
 
       // The run's non-Hive output folder: written by this run, named by this run's configuration.
       val outputs = run.outputDirectories.map(directory =>
         PrimaryReader.ScopeEntry(PrimaryUtilities.qualifyPath(directory), "", "", "", businessDate))
 
-      if (location.isEmpty)
+      if (location.isEmpty && !run.isTableGranular)
         log.warn(s"Could not resolve the location of database '${run.database}'; run ${run.runId} " +
           "is scoped by metastore identity only. A partition that exists on disk but not in the " +
           "catalogue will not be found.")
@@ -278,12 +276,65 @@ class EngineRunReader()(implicit sparkSession: SparkSession, conf: Config) {
     loaded
   }
 
+  /**
+   * Read a run configuration, and say so when it declares the same key twice with two values.
+   *
+   * `Properties.load` keeps the last of them silently. In the classic simulator's configuration
+   * `input.path.projection` is declared twice with DIFFERENT files, so one of the two disappears —
+   * and an input that disappears is an input PC14 will not protect, on a run whose whole safety
+   * argument is that shared inputs are never deleted. The engine still reads the file the standard
+   * way; it no longer does so quietly.
+   */
   private def readProperties(path: String): Map[String, String] = {
     import scala.collection.JavaConverters._
-    val reader = PrimaryUtilities.getHdfsReader(path)(sparkSession.sparkContext)
+
+    val text = {
+      val reader = PrimaryUtilities.getHdfsReader(path)(sparkSession.sparkContext)
+      try {
+        val buffer = new StringBuilder
+        val chunk = new Array[Char](8192)
+        var read = reader.read(chunk)
+        while (read >= 0) {
+          buffer.appendAll(chunk, 0, read)
+          read = reader.read(chunk)
+        }
+        buffer.toString
+      } finally reader.close()
+    }
+
+    warnOnConflictingKeys(path, text)
+
     val properties = new Properties()
-    try properties.load(reader) finally reader.close()
+    properties.load(new java.io.StringReader(text))
     properties.asScala.toMap
+  }
+
+  /**
+   * Say so when a configuration declares the same key twice with two different values.
+   *
+   * `Properties.load` keeps the last of them silently. The classic simulator's configuration
+   * declares `input.path.projection` twice, naming two different files, so one of them disappears —
+   * and an input that disappears is an input PC14 will not protect, on an engine whose whole safety
+   * argument is that shared inputs are never deleted. The file is still read the standard way; it is
+   * no longer read quietly.
+   */
+  private def warnOnConflictingKeys(path: String, text: String): Unit = {
+    val conflicting = scala.io.Source.fromString(text).getLines()
+      .map(_.trim)
+      .filter(line => line.nonEmpty && !line.startsWith("#") && line.contains("="))
+      .map { line =>
+        val separator = line.indexOf('=')
+        line.substring(0, separator).trim -> line.substring(separator + 1).trim
+      }
+      .toSeq
+      .groupBy { case (key, _) => key }
+      .collect { case (key, pairs) if pairs.map { case (_, v) => v }.distinct.size > 1 => key }
+      .toSeq
+      .sorted
+
+    if (conflicting.nonEmpty)
+      log.warn(s"$path declares ${conflicting.size} key(s) twice with different values; only the " +
+        s"last of each is read and the other is lost: ${conflicting.mkString(", ")}")
   }
 
   /**
@@ -298,6 +349,50 @@ class EngineRunReader()(implicit sparkSession: SparkSession, conf: Config) {
    * `engine.databaseLocation` survives only as a fallback for a session with no metastore to ask,
    * and saying so costs a warning every time it is used.
    */
+  /**
+   * Where one of a run's tables actually put its data.
+   *
+   * For a partition-granular engine this is `<database location>/<table>/runId=<uuid>` — the table
+   * sits under its database, and deriving it costs no metastore call per table.
+   *
+   * A TABLE-granular engine cannot be read that way. The classic simulator's outputs are EXTERNAL
+   * tables whose location is a production output tree (`…/Simulateur_Production/Output_Simulateur/
+   * facs_<scenario>_<t>/…`) entirely outside `dbsimulateur.db`, so `<database location>/<table>`
+   * names a directory that was never written. Its registered LOCATION is asked of the metastore
+   * instead — which also resolves the `%s`/`%t` placeholders the configuration carries, without this
+   * engine having to know what they stand for.
+   */
+  private def pathOf(run: EngineRun, table: String, databaseRoot: Option[String]): Option[String] = {
+    if (!run.isTableGranular)
+      return databaseRoot.map(root => PrimaryUtilities.normalizePath(s"$root/${run.relativePathOf(table)}"))
+
+    tableLocation(run.database, table).orElse {
+      // No fallback to `<database location>/<table>` on purpose. For this shape of engine that path
+      // is very probably wrong — the tables are external and written elsewhere — and a wrong path in
+      // a purge scope is worse than no path: it matches nothing while looking like coverage. The
+      // metastore identity entry still covers the table. The commonest reason to land here is
+      // benign: a `_nosecto` variant the run never wrote.
+      log.info(s"The metastore holds no location for '${run.database}.$table'; it is scoped by " +
+        "metastore identity only (a variant that was never written simply does not exist)")
+      None
+    }
+  }
+
+  /** A table's registered location, or None when the metastore does not hold the table. */
+  private def tableLocation(database: String, table: String): Option[String] =
+    try {
+      val catalog = sparkSession.sessionState.catalog
+      val identifier = org.apache.spark.sql.catalyst.TableIdentifier(table, Some(database))
+      if (!catalog.tableExists(identifier)) None
+      else catalog.getTableMetadata(identifier).storage.locationUri
+        .map(uri => PrimaryUtilities.normalizePath(uri.toString))
+    } catch {
+      case e: Throwable =>
+        log.warn(s"Metastore lookup of table '$database.$table' failed " +
+          s"(${e.getClass.getSimpleName}: ${e.getMessage})")
+        None
+    }
+
   private def databaseLocation(database: String): Option[String] = {
     val fromMetastore =
       try Some(PrimaryUtilities.normalizePath(sparkSession.catalog.getDatabase(database).locationUri))

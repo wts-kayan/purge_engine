@@ -66,6 +66,7 @@ class PurgeExecutorSpec extends AnyFunSuite with Matchers with BeforeAndAfterEac
       table_name = "",
       partition_spec = "",
       is_registered_partition = false,
+      is_registered_table = false,
       strategy = strategy,
       decision = decision,
       // as the inventory reports it: a LEAF_DIR's size is the sum of the files it holds, never the
@@ -313,6 +314,72 @@ class PurgeExecutorSpec extends AnyFunSuite with Matchers with BeforeAndAfterEac
     // partition values come from a filesystem path, which is not a place to trust
     PurgeExecutor.partitionPredicate("runid=a'b") shouldBe "`runid`='a\\'b'"
   }
+
+  // ---- a whole table, for a table-granular engine ------------------------------------------------
+  //
+  // Every STR output table is EXTERNAL with external.table.purge = TRUE - for projection and for the
+  // classic simulator alike - so a bare DROP TABLE deletes the data through Hive, outside this
+  // engine's deletion path and with no certainty that Trash is honoured. These tests pin the
+  // ordering that makes it safe: the data is trashed FIRST, and Hive is then asked to drop a table
+  // whose location is already empty.
+
+  private def externalTable(name: String): Path = {
+    val dir = partition(s"$name/data")
+    spark.sql(s"DROP TABLE IF EXISTS $name")
+    spark.sql(s"CREATE TABLE $name (a INT) USING orc LOCATION '${dir.toUri.toString}'")
+    dir
+  }
+
+  private def tableRow(dir: Path, name: String): ManifestRow =
+    row(dir).copy(database_name = "default", table_name = name, is_registered_table = true)
+
+  test("a whole registered table is trashed and then dropped") {
+    val dir = externalTable("purge_test_fac")
+    val record = purgeRun(Seq(tableRow(dir, "purge_test_fac"))).records.head
+
+    record.status shouldBe PurgeExecutor.STATUS_TABLE_DROPPED
+    exists(dir) shouldBe false
+    spark.catalog.tableExists("default", "purge_test_fac") shouldBe false
+  }
+
+  test("the data goes to Trash, so dropping the table does not cost the restore window") {
+    val dir = externalTable("purge_test_ordering")
+    val record = purgeRun(Seq(tableRow(dir, "purge_test_ordering"))).records.head
+
+    record.trashPath should include(".Trash/Current")
+    record.restoreDeadline should not be empty
+    spark.sql("DROP TABLE IF EXISTS purge_test_ordering")
+  }
+
+  test("a row marked as a whole table but carrying a partition spec does not drop the table") {
+    val dir = externalTable("purge_test_conflict")
+    val record = purgeRun(Seq(
+      tableRow(dir, "purge_test_conflict").copy(partition_spec = "runid=abc"))).records.head
+
+    record.status should not be PurgeExecutor.STATUS_TABLE_DROPPED
+    spark.catalog.tableExists("default", "purge_test_conflict") shouldBe true
+    spark.sql("DROP TABLE IF EXISTS purge_test_conflict")
+  }
+
+  test("dropHiveTable = false removes the data and keeps the table definition") {
+    val dir = externalTable("purge_test_keep")
+    val record = purgeRun(Seq(tableRow(dir, "purge_test_keep")),
+      conf("dropHiveTable = false")).records.head
+
+    record.status shouldBe PurgeExecutor.STATUS_TRASHED
+    exists(dir) shouldBe false
+    spark.catalog.tableExists("default", "purge_test_keep") shouldBe true
+    spark.sql("DROP TABLE IF EXISTS purge_test_keep")
+  }
+
+  test("a partition of a table is still dropped as a partition, not as a table") {
+    val dir = partition("term_structure/runId=xyz")
+    val record = purgeRun(Seq(row(dir).copy(
+      database_name = "default", table_name = "term_structure",
+      partition_spec = "runid=xyz", is_registered_partition = true))).records.head
+
+    record.status should not be PurgeExecutor.STATUS_TABLE_DROPPED
+  }
 }
 
 /** The manifest columns the executor reads, as a case class so a test can build one row by hand. */
@@ -322,6 +389,7 @@ final case class ManifestRow(path: String,
                              table_name: String,
                              partition_spec: String,
                              is_registered_partition: Boolean,
+                             is_registered_table: Boolean,
                              strategy: String,
                              decision: String,
                              size_bytes: Long,

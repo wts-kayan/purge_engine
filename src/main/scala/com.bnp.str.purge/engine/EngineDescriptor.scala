@@ -70,7 +70,8 @@ object EngineDescriptor {
 
   /** The engines this purge engine understands. Projection is the MVP; others follow the same shape. */
   val registry: Map[String, EngineDescriptor] =
-    Seq(ProjectionEngine).map(descriptor => descriptor.name.toLowerCase -> descriptor).toMap
+    Seq(ProjectionEngine, SimulatorClassicEngine)
+      .map(descriptor => descriptor.name.toLowerCase -> descriptor).toMap
 
   /**
    * Resolve an engine by name, refusing an unknown one by listing what is supported.

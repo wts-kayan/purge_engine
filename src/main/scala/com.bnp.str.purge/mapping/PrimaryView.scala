@@ -103,6 +103,7 @@ object PrimaryView {
        |       , t.table_name      AS table_table
        |       , t.table_type      AS table_table_type
        |       , t.external_purge  AS table_external_purge
+       |       , (w.path = t.location_path) AS is_table_root
        |       , ROW_NUMBER() OVER (
        |           PARTITION BY w.path
        |           ORDER BY LENGTH(COALESCE(t.location_path, '')) DESC, COALESCE(t.table_name, '')
@@ -119,6 +120,10 @@ object PrimaryView {
        |       , COALESCE(partition_table,    table_table,    '')            AS table_name
        |       , COALESCE(partition_spec, '')                                AS partition_spec
        |       , (partition_spec IS NOT NULL)                                AS is_registered_partition
+       |       -- The object IS a registered table, not merely something underneath one. Exact
+       |       -- equality with the table's own location, which is what makes DROP TABLE the right
+       |       -- instrument rather than DROP PARTITION: see PurgeExecutor.maybeDropTable.
+       |       , COALESCE(is_table_root, FALSE)                               AS is_registered_table
        |       , COALESCE(partition_table_type, table_table_type, '')        AS table_type
        |       , COALESCE(partition_external_purge, table_external_purge, '') AS external_purge
        |  FROM with_table
@@ -212,6 +217,7 @@ object PrimaryView {
        |     , table_name
        |     , partition_spec
        |     , is_registered_partition
+       |     , is_registered_table
        |     , table_type
        |     , external_purge
        |     , policy_id

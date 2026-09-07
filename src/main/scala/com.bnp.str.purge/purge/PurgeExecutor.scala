@@ -45,6 +45,17 @@ class PurgeExecutor()(implicit sparkSession: SparkSession, conf: Config) {
   private val dropHivePartition: Boolean =
     PrimaryUtilities.getBooleanOr(executionConfig, "dropHivePartition", default = true)
 
+  /**
+   * Whether a purged object that IS a whole registered table also has its table dropped.
+   *
+   * On by default, for the same reason `dropHivePartition` is: leaving the table registered against
+   * a location whose data has just been trashed is orphan metadata — a table every consumer can
+   * still see and nothing can read. It is separately switchable because dropping a table is a larger
+   * act than dropping a partition, and a perimeter may want the data gone and the definition kept.
+   */
+  private val dropHiveTable: Boolean =
+    PrimaryUtilities.getBooleanOr(executionConfig, "dropHiveTable", default = true)
+
   private val stopOnFirstError: Boolean =
     PrimaryUtilities.getBooleanOr(executionConfig, "stopOnFirstError", default = false)
 
@@ -151,6 +162,7 @@ class PurgeExecutor()(implicit sparkSession: SparkSession, conf: Config) {
 
     val bytes = longOf(row, "size_bytes")
     val registered = booleanOf(row, "is_registered_partition")
+    val registeredTable = booleanOf(row, "is_registered_table")
 
     strategy match {
       case PurgeStrategy.Logical =>
@@ -160,7 +172,7 @@ class PurgeExecutor()(implicit sparkSession: SparkSession, conf: Config) {
 
       case PurgeStrategy.Hard =>
         fs.delete(path, true)
-        maybeDropPartition(row, registered)
+        if (!maybeDropPartition(row, registered)) maybeDropTable(row, registeredTable)
         record(row, runId, userLauncher, executedAt, strategy, STATUS_DELETED,
           bytesFreed = bytes, trashPath = "", restoreDeadline = None, error = "")
 
@@ -174,9 +186,11 @@ class PurgeExecutor()(implicit sparkSession: SparkSession, conf: Config) {
           failure(row, runId, userLauncher, executedAt,
             "Trash is unavailable (fs.trash.interval = 0?); refusing to fall back to a hard delete")
         else {
-          val dropped = maybeDropPartition(row, registered)
+          val partitionDropped = maybeDropPartition(row, registered)
+          val tableDropped = !partitionDropped && maybeDropTable(row, registeredTable)
           val status =
-            if (dropped) STATUS_PARTITION_DROPPED
+            if (partitionDropped) STATUS_PARTITION_DROPPED
+            else if (tableDropped) STATUS_TABLE_DROPPED
             else if (moved) STATUS_TRASHED
             else STATUS_DELETED
           record(row, runId, userLauncher, executedAt, strategy, status,
@@ -207,6 +221,52 @@ class PurgeExecutor()(implicit sparkSession: SparkSession, conf: Config) {
     } catch {
       case e: Throwable =>
         log.warn(s"[purge] data removed but the partition could not be dropped — $sql " +
+          s"(${e.getClass.getSimpleName}: ${e.getMessage})")
+        false
+    }
+  }
+
+  /**
+   * Drop the TABLE the object was, once its data is gone.
+   *
+   * The table-granular twin of [[maybeDropPartition]], and it exists for the same reason: for a
+   * table-granular engine — the classic simulator — a run IS its tables, so removing the data and
+   * leaving the tables registered would be a half-done purge that still reports success.
+   *
+   * The ordering is what makes it safe, and it is not optional. Every STR output table is EXTERNAL
+   * with `external.table.purge = TRUE` — confirmed for projection AND simulator — so a bare
+   * `DROP TABLE` deletes the data itself, through Hive, outside this engine's deletion path and with
+   * no certainty that Trash is honoured. By the time this runs the data has already been moved to
+   * Trash and the location is empty, so the drop is pure metadata and the 7-day restore window
+   * still holds.
+   *
+   * Best-effort and reported, like the partition drop: failing the object AFTER its data is gone
+   * would make the run look worse than it is and invite a re-run with nothing left to do.
+   */
+  private def maybeDropTable(row: Row, registeredTable: Boolean): Boolean = {
+    if (!registeredTable || !dropHiveTable) return false
+
+    val database = stringOf(row, "database_name")
+    val table = stringOf(row, "table_name")
+    if (database.isEmpty || table.isEmpty) return false
+
+    // A row carrying a partition spec is a partition of a table, never the table itself. Refusing
+    // here as well as at the call site is deliberate: of all the mistakes this engine could make,
+    // dropping a table where a partition was meant is the one it must not make twice.
+    if (stringOf(row, "partition_spec").nonEmpty) {
+      log.warn(s"[purge] $database.$table is marked as a whole table but carries a partition spec; " +
+        "refusing to drop the table")
+      return false
+    }
+
+    val sql = s"DROP TABLE IF EXISTS `$database`.`$table`"
+    try {
+      sparkSession.sql(sql)
+      log.info(s"[purge] dropped table $database.$table")
+      true
+    } catch {
+      case e: Throwable =>
+        log.warn(s"[purge] data removed but the table could not be dropped - $sql " +
           s"(${e.getClass.getSimpleName}: ${e.getMessage})")
         false
     }
@@ -310,11 +370,13 @@ object PurgeExecutor {
 
   /** The manifest columns the executor reads. Anything else in the manifest is not its business. */
   val MANIFEST_COLUMNS = Seq("path", "request_id", "database_name", "table_name", "partition_spec",
-    "is_registered_partition", "strategy", "decision", "size_bytes", "num_files", "modification_time")
+    "is_registered_partition", "is_registered_table", "strategy", "decision", "size_bytes",
+    "num_files", "modification_time")
 
   val STATUS_DELETED = "DELETED"
   val STATUS_TRASHED = "TRASHED"
   val STATUS_PARTITION_DROPPED = "PARTITION_DROPPED"
+  val STATUS_TABLE_DROPPED = "TABLE_DROPPED"
   val STATUS_LOGICALLY_DELETED = "LOGICALLY_DELETED"
   val STATUS_SKIPPED_BLOCKED = "SKIPPED_BLOCKED"
   val STATUS_SKIPPED_ABSENT = "SKIPPED_ABSENT"
@@ -324,7 +386,7 @@ object PurgeExecutor {
 
   /** Statuses meaning the object is gone from where it was. */
   val REMOVED_STATUSES =
-    Set(STATUS_DELETED, STATUS_TRASHED, STATUS_PARTITION_DROPPED)
+    Set(STATUS_DELETED, STATUS_TRASHED, STATUS_PARTITION_DROPPED, STATUS_TABLE_DROPPED)
 
   /**
    * `runid=abc/scenario=FW` -> ``` `runid`='abc', `scenario`='FW' ```
