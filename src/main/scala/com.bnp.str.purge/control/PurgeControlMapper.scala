@@ -258,6 +258,14 @@ class PurgeControlMapper(checks: CheckConfig,
    * only the offending tables are blocked when the per-table share is. A purge that is defensible
    * object by object can still be a mistake taken together, and that is precisely the mistake an
    * approver is least able to catch by reading a list.
+   *
+   * **The per-table share does not apply to an object that IS a whole table.** `maxPercentOfTable`
+   * asks "would this gut a partitioned table?", and for a table-granular run — the classic
+   * simulator, where a run IS its tables — the answer is 100% by construction: the table holds
+   * exactly one object, itself. Left in, the ceiling would block every simulator purge that was ever
+   * attempted, for a reason that reads like a safety margin and is really an arithmetic accident.
+   * The ceilings that DO apply to such a run are the ones on total bytes and total objects, and they
+   * are unchanged.
    */
   private def blastRadius(manifest: DataFrame): RuleEval = {
     val rule = PurgeRule.BlastRadius
@@ -274,7 +282,13 @@ class PurgeControlMapper(checks: CheckConfig,
     val tooManyObjects = objects > checks.maxObjects
     val tooManyBytes = bytes > checks.maxBytes
 
-    val overShare = manifest
+    // Whole tables are excluded from the share before it is computed, not blocked and then excused.
+    val partitionsOnly =
+      if (manifest.columns.contains("is_registered_table"))
+        manifest.where(!coalesce(col("is_registered_table"), lit(false)))
+      else manifest
+
+    val overShare = partitionsOnly
       .groupBy(col("version_group"))
       .agg(count(lit(1)).as("selected"), max(coalesce(col("version_group_total"), lit(0))).as("total"))
       .where(col("total") > 0 && (col("selected") * 100.0 / col("total")) > checks.maxPercentOfTable)
@@ -296,11 +310,15 @@ class PurgeControlMapper(checks: CheckConfig,
       if (runLevel) s"the run exceeds a ceiling: $objects object(s), ${PrimaryUtilities.humanBytes(bytes)}"
       else s"more than ${checks.maxPercentOfTable}% of this table's vintages"
 
+    val wholeTable =
+      if (manifest.columns.contains("is_registered_table")) coalesce(col("is_registered_table"), lit(false))
+      else lit(false)
+
     RuleEval(rule,
       condition = Some(
         if (runLevel) lit(true)
         else if (overShare.isEmpty) lit(false)
-        else col("version_group").isin(overShare.toSeq: _*)),
+        else col("version_group").isin(overShare.toSeq: _*) && !wholeTable),
       value = Some(lit(reasonText)))
   }
 

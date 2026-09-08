@@ -25,3 +25,7 @@ metastore_db/
 
 # Claude Code local agent files
 .claude/
+
+# generated output of the simulator rehearsal
+localRun/purge/output_simulator/
+spark-warehouse/

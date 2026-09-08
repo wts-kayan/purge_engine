@@ -113,8 +113,39 @@ To watch the engine actually delete, set `request.mode = "SIMULATE_AND_EXECUTE"`
 `localRun/purge/input/` is version-controlled, so `git checkout` puts the fixture back; everything the
 engine writes (`output/`, `reports/`, `run_history/`) is git-ignored.
 
-Two knobs in `localRun/purge/application.conf` are worth turning at least once, because they show the
-engine refusing rather than working:
+### The simulator rehearsal
+
+`localRun/purge/application_simulator.conf` drives the same thing against the **classic simulator** —
+the table-granular engine, where a run IS its tables:
+
+```bash
+spark-submit --class com.bnp.str.purge.job.SimulationDriver \
+             target/str-purge-engine.jar localRun/purge/application_simulator.conf
+```
+
+Its fixture reproduces the shape of the cluster rather than a convenient version of it: tables that
+live nowhere near their database, the engine's own `run_history` and shared results table sitting
+inside the scope root, and a neighbouring simulation the purge must leave alone. The run
+configuration is the real one TWIST generated, used unedited — nothing in it is rewritten for local
+use, because nothing in it names a path the engine relies on.
+
+To watch it delete, set `request.mode = "SIMULATE_AND_EXECUTE"` and **give the run a Trash window**:
+
+```bash
+spark-submit --conf spark.hadoop.fs.trash.interval=10080 \
+             --class com.bnp.str.purge.job.MainDriver \
+             target/str-purge-engine.jar localRun/purge/application_simulator.conf
+# -> PURGE SUCCESS - 3 object(s) removed, 228 B freed [TABLE_DROPPED=3]
+```
+
+A laptop has `fs.trash.interval = 0`, and the engine **fails** an object rather than falling back to
+an unrecoverable delete — so without that flag every object fails and the run ends `PARTIAL`. That
+is the design working, not a fixture problem. Restore the tree afterwards with
+`git checkout localRun/purge/input/simulator_classic`.
+
+### Knobs worth turning
+
+Two in `localRun/purge/application.conf`, because they show the engine refusing rather than working:
 
 - **`request.asOfDate`** is pinned to `2027-01-15`. The fixture run is an as-of 2026Q3 projection and
   the policy grants one quarter of retention, so it is just old enough to go. Set the date before
