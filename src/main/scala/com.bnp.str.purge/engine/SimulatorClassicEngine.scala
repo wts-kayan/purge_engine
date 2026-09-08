@@ -79,10 +79,18 @@ object SimulatorClassicEngine extends EngineDescriptor {
     "output.externalTable.nameFacilityMeasurementOutput",
     "output.externalTable.nameFacilityMeasurementByTermOutput")
 
-  /** Tables the engine writes that belong to no single run, and that a purge must never remove. */
+  /**
+   * Tables the engine writes that belong to no single run, and that a purge must never remove.
+   *
+   * `global.output.table.name` is the results table EVERY run writes into — one run's purge must not
+   * take another's rows with it — and `global.output.table.metadata` is the run metadata. Alongside
+   * `run.history.tablename` they are the record that the runs happened at all, which is also the
+   * evidence that a purge of one of them was legitimate. Confirmed by the business on 2026-09-08:
+   * the history is never purged.
+   */
   private[engine] val SHARED_TABLE_KEYS = Seq(
-    "global.output.table.name",     // simulation_results_fac_partitioned_full — every run writes to it
-    "global.output.table.metadata") // run_metadata — the evidence a purge was legitimate
+    "global.output.table.name",     // simulation_results_fac_partitioned_full
+    "global.output.table.metadata") // run_metadata
 
   override def read(properties: Map[String, String], confPath: String): EngineRun = {
     val database = value(properties, "global.output.database.name").toLowerCase
@@ -115,7 +123,8 @@ object SimulatorClassicEngine extends EngineDescriptor {
       // Deliberately empty — see reading 2 in the class comment. This engine purges tables.
       outputDirectories = Seq.empty,
       inputPaths = inputPaths(properties),
-      confPath = confPath)
+      confPath = confPath,
+      protectedTables = protectedTables(properties))
   }
 
   /**
@@ -140,6 +149,17 @@ object SimulatorClassicEngine extends EngineDescriptor {
           None
         } else Some(split(declared, database, key, confPath))
       }
+      .distinct
+
+  /**
+   * The engine's own tables that no run owns — never purged, and named so PC14 can refuse a scope
+   * that reached one however it was drawn.
+   */
+  private def protectedTables(properties: Map[String, String]): Seq[String] =
+    SHARED_TABLE_KEYS
+      .map(key => value(properties, key))
+      .filter(_.nonEmpty)
+      .map(table => table.substring(table.indexOf('.') + 1).toLowerCase)
       .distinct
 
   /**

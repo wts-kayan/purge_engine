@@ -32,6 +32,9 @@ package com.bnp.str.purge.engine
  * @param outputDirectories non-Hive output the run wrote, e.g. its cluster output folder
  * @param inputPaths        the files the run READ. Shared across runs and never this run's to
  *                          delete — see control PC14.
+ * @param protectedTables   tables in the same database that this engine writes and that NO run owns
+ *                          — its audit and its shared results. Never purged, whoever asks: they are
+ *                          the record that the runs happened, and the data of every other run.
  * @param confPath          where this description was read from, for the report and the audit
  */
 final case class EngineRun(engine: String,
@@ -47,7 +50,8 @@ final case class EngineRun(engine: String,
                            historyTable: String,
                            outputDirectories: Seq[String],
                            inputPaths: Seq[String],
-                           confPath: String) {
+                           confPath: String,
+                           protectedTables: Seq[String] = Seq.empty) {
 
   EngineDescriptor.requireKnownGranularity(engine, granularity)
 

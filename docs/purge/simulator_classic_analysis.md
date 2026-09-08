@@ -142,7 +142,7 @@ A simulator run writes into three different kinds of place, and only the first i
 |---|---|---|---|
 | 1 | Per-run external tables | `output.externalTable.nameFacilityOutput`, `…nameFacilityMeasurementByTermOutput` | **Yes** — this is the run |
 | 2 | A shared, partitioned results table | `global.output.table.name=simulation_results_fac_partitioned_full` | **No, not as a table.** Shared across runs; at most this run's partitions |
-| 3 | The run metadata / history | `global.output.table.metadata=run_metadata`, `run.history.tablename=RUN_HISTORY` | **Never** — it is the evidence the purge was legitimate |
+| 3 | The run metadata / history | `global.output.table.metadata=run_metadata`, `run.history.tablename=RUN_HISTORY` | **Never** — confirmed 2026-09-08, and now *enforced*: declared as protected, so PC14 refuses any candidate that is one of them or contains one |
 
 Item 2 is the awkward one: a simulator run is table-granular for its own outputs **and**
 partition-granular inside the global table. The engine's granularity is currently one value per
@@ -273,6 +273,27 @@ What a purge removes is therefore: **the tables those keys resolve to — each t
 `_nosecto` twin (H8) — and the data at their registered locations.** For simulation 4363 that is two
 declared tables and up to two twins. Nothing that is only a path, nothing shared, nothing global.
 
+### And what it never removes
+
+Three tables in `dbsimulateur` are the engine's own, not any run's, and the business confirmed on
+2026-09-08 that the history is never purged:
+
+| Table | From | Why it survives every purge |
+|---|---|---|
+| `run_history` | `run.history.tablename` | the record that the runs happened, and the evidence that a purge of one was legitimate |
+| `run_metadata` | `global.output.table.metadata` | the same, per run |
+| `simulation_results_fac_partitioned_full` | `global.output.table.name` | every run writes into it; one run's purge must not take another's rows |
+
+Leaving them out of the scope is not enough on its own — that only protects them from an
+engine-driven purge. They are **declared as protected**, so PC14 blocks them however a scope was
+drawn: a hand-picked path, a policy sweeping the database, or a scope root one level too high. Each
+is located by asking the metastore for the table rather than assuming `<database>/<name>`, because
+protecting the wrong directory protects nothing.
+
+**Each run owns its tables** (confirmed 2026-09-08). That is what makes dropping a table the right
+instrument here rather than deleting rows from a shared one — and it is the assumption `DROP TABLE`
+rests on, so it is written down rather than left implicit.
+
 ---
 
 ## 6. Questions still open
@@ -284,14 +305,12 @@ declared tables and up to two twins. Nothing that is only a path, nothing shared
    PC04, whose "is a job still writing here?" token cannot be built from a run id that appears in no
    path. Until it is answered, **PC04 is weak for this engine** — it still catches an unfinished run
    through `end_date IS NULL`, but cannot tie one to a table.
-2. **Are `dbsimulateur.RUN_HISTORY` and `run_metadata` per-run or shared?** The descriptor qualifies
-   the first as `dbsimulateur.run_history` (H7) and treats both as never purgeable; confirmation is
-   still wanted.
-3. **Do `Locked` and `Archive Status` gate a purge?** (H9) — and if so, does TWIST enforce them, or
+2. **Do `Locked` and `Archive Status` gate a purge?** (H9) — and if so, does TWIST enforce them, or
    pass them to the engine so PC02 can?
-4. **Is one simulation always one configuration file?** If a simulator run can be re-launched into
-   the same tables, `output.append.method=OVERWRITE` says the second run replaces the first, and
-   "which run does this table belong to" has more than one answer.
+3. **Is one simulation always one configuration file?** — *answered 2026-09-08: yes, each run owns
+   its tables.* Kept here only as the assumption it is: the descriptor drops a table outright on the
+   strength of it, so if a relaunch ever writes into an existing simulation's tables
+   (`output.append.method=OVERWRITE`), this needs revisiting before it does.
 
 ---
 

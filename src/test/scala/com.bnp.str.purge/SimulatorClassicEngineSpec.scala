@@ -128,6 +128,24 @@ class SimulatorClassicEngineSpec extends AnyFunSuite with Matchers {
     run.tables should not contain "run_metadata"
   }
 
+  test("the run history is never purged, and is named so PC14 can refuse a scope that reached it") {
+    // Confirmed by the business on 2026-09-08. It is the record that the runs happened, and the
+    // evidence that a purge of one of them was legitimate.
+    run.historyTable shouldBe "dbsimulateur.run_history"
+    run.tables.exists(_.contains("run_history")) shouldBe false
+  }
+
+  test("the tables no run owns are declared as protected, not merely left out of the scope") {
+    // Left out of the scope, they are safe from an ENGINE-driven purge. Declared as protected, they
+    // are also safe from a hand-picked path or a policy sweeping the database.
+    run.protectedTables should contain theSameElementsAs Seq(
+      "simulation_results_fac_partitioned_full", "run_metadata")
+  }
+
+  test("a protected table is never also a scoped one") {
+    run.protectedTables.foreach(protectedTable => run.tables should not contain protectedTable)
+  }
+
   test("no template is ever read as a table name") {
     // output.externalTable.name = output_%s_%t, and the three monte-carlo keys are templates too.
     run.tables.exists(_.contains("%")) shouldBe false

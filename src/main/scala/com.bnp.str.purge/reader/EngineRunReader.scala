@@ -100,19 +100,38 @@ class EngineRunReader()(implicit sparkSession: SparkSession, conf: Config) {
   }
 
   /**
-   * Everything the runs declare as INPUT, plus their history tables — objects that are inside the
-   * blast radius of a badly drawn scope and are never a run's own data to delete. Control PC14
-   * refuses any candidate that is one of these, or that contains one.
+   * Everything the runs declare as INPUT, plus the tables the engine keeps for itself — objects
+   * inside the blast radius of a badly drawn scope and never a run's own data to delete. Control
+   * PC14 refuses any candidate that is one of these, or that contains one.
+   *
+   * The engine's own tables are its run HISTORY — never purged, whoever asks, because it is the
+   * record that the runs happened and the evidence that a purge of one was legitimate — and
+   * whatever else the descriptor declares as belonging to no single run: for the classic simulator,
+   * the shared results table every run writes into and its run metadata.
+   *
+   * Each is located the way the outputs are, by asking the metastore for the TABLE, and only then
+   * falling back to `<database location>/<name>`. Protecting the wrong directory protects nothing,
+   * and these tables are external and may live outside their database exactly as the outputs do.
    */
   lazy val protectedPaths: Seq[String] = {
     val inputs = runs.flatMap(_.inputPaths).map(PrimaryUtilities.qualifyPath)
-    val histories = runs.flatMap(run => databaseLocation(run.database).map { root =>
-      PrimaryUtilities.normalizePath(s"$root/${tableNameOf(run.historyTable)}")
-    })
-    val all = (inputs ++ histories).filter(_.nonEmpty).distinct
-    if (all.nonEmpty) log.info(s"${all.size} path(s) protected as shared inputs or run history")
+
+    val ownTables = runs.flatMap { run =>
+      val names = (tableNameOf(run.historyTable) +: run.protectedTables).filter(_.nonEmpty).distinct
+      names.flatMap(name => protectedLocation(run.database, name))
+    }
+
+    val all = (inputs ++ ownTables).filter(_.nonEmpty).distinct
+    if (all.nonEmpty)
+      log.info(s"${all.size} path(s) protected as shared inputs, run history or shared output")
     all
   }
+
+  /** Where a protected table lives: its own registered location, else under its database. */
+  private def protectedLocation(database: String, table: String): Option[String] =
+    tableLocation(database, table)
+      .orElse(databaseLocation(database).map(root =>
+        PrimaryUtilities.normalizePath(s"$root/$table")))
 
   /**
    * The engine's OWN run history, normalised to the columns the controls read.
