@@ -631,11 +631,24 @@ ORC, `PARTITIONED BY (purge_date, run_id)`.
 run_id, request_id, object_type, path, database_name, table_name, partition_spec,
 size_bytes, num_files, modification_time, access_time, owner_name,
 business_date, business_date_source, age_days, selection_source,
+source_engine, source_run_id,
 policy_id, retention_value, retention_unit, retention_cutoff, keep_min_versions,
 strategy, legal_hold, archive_required, archive_root, owner_group,
 version_group, version_rank, is_registered_partition, external_purge,
 decision, controls_ko, controls_warn, manifest_fingerprint, generated_at
 ```
+
+### 9.2bis Where the audit lives: `dbpurge`
+
+`purge_detail` and the purge engine's `run_history` live in **`dbpurge`**, a database of the purge
+engine's own, and not in the database being purged.
+
+The reason is the one that governs everything else here: an audit that sits inside its subject is an
+audit a wide enough purge can take with it. `dbpurge` is never any engine's output, so nothing an
+engine-driven scope expands to can reach it, and `allowedRoots` can exclude it outright. It also
+gives the IHM's history screen and any auditor a single place to look, whichever engine a run was
+about. The tables keep `external.table.purge = FALSE` (§14ter), so even `DROP TABLE` on them leaves
+the ORC behind.
 
 ### 9.3 `purge_detail` — written by the execution
 
@@ -645,8 +658,15 @@ ORC external Hive table, `PARTITIONED BY (purge_date, run_id)` — the object-le
 ```
 run_id, request_id, path, database_name, table_name, partition_spec, strategy,
 status, bytes_freed, num_files, trash_path, restore_deadline, error_message,
-executed_at, user_launcher
+executed_at, user_launcher, source_engine, source_run_id
 ```
+
+`source_engine` / `source_run_id` name the engine run each object belonged to, carried from the
+scope through the manifest. Without them "what happened to run X?" is answerable only at run level,
+through `run_history.scenarios` — and for a table-granular engine, whose rows carry no partition
+spec and whose table names carry no run id, not per object at all. They are appended at the end of
+the table, so a `purge_detail` registered by an earlier version needs only
+`ALTER TABLE … ADD COLUMNS`.
 
 `status ∈ { DELETED, TRASHED, PARTITION_DROPPED, TABLE_DROPPED, LOGICALLY_DELETED, SKIPPED_BLOCKED,
 SKIPPED_ABSENT, SKIPPED_DRIFT, SKIPPED_ABORTED, FAILED }`.
@@ -795,7 +815,7 @@ purge_app {
 
   purge_detail {
     enable   = true
-    database = "dbiris"
+    database = "dbpurge"                 # the purge engine's own database, never an engine's output
     table    = "purge_detail"
     root     = "/data/promethee/str/purge/purge_detail"
   }
@@ -805,7 +825,7 @@ purge_app {
   # ---- shared run audit (module_name = purge) ----
   audit {
     enabled      = true
-    database     = "dbiris"
+    database     = "dbpurge"
     table        = "run_history"
     root         = "/data/promethee/str/run_history"
     userLauncher = "j03627"

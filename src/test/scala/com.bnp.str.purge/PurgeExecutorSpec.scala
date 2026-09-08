@@ -75,7 +75,9 @@ class PurgeExecutorSpec extends AnyFunSuite with Matchers with BeforeAndAfterEac
       num_files = 1L,
       // likewise the mtime: the NEWEST of the directory and the files it holds
       modification_time =
-        if (modificationTime != null) modificationTime else new Timestamp(contentMtime(path)))
+        if (modificationTime != null) modificationTime else new Timestamp(contentMtime(path)),
+      source_engine = "projection",
+      source_run_id = "9df8cf3a-c2fa-4bfd-9068-aa6587ba84cf")
   }
 
   private def manifestOf(rows: ManifestRow*): DataFrame = {
@@ -380,6 +382,15 @@ class PurgeExecutorSpec extends AnyFunSuite with Matchers with BeforeAndAfterEac
 
     record.status should not be PurgeExecutor.STATUS_TABLE_DROPPED
   }
+
+  test("every detail record says which engine run the object belonged to") {
+    // The point of the column: purge_detail can be filtered by the run that was purged, whatever the
+    // engine's granularity. A table-granular row has no partition spec to recover it from.
+    val record = purgeRun(Seq(row(partition("t/runId=abc")))).records.head
+
+    record.sourceEngine shouldBe "projection"
+    record.sourceRunId shouldBe "9df8cf3a-c2fa-4bfd-9068-aa6587ba84cf"
+  }
 }
 
 /** The manifest columns the executor reads, as a case class so a test can build one row by hand. */
@@ -394,4 +405,6 @@ final case class ManifestRow(path: String,
                              decision: String,
                              size_bytes: Long,
                              num_files: Long,
-                             modification_time: Timestamp)
+                             modification_time: Timestamp,
+                             source_engine: String,
+                             source_run_id: String)

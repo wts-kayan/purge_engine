@@ -75,16 +75,18 @@ class EngineRunReader()(implicit sparkSession: SparkSession, conf: Config) {
       // WHAT a run occupies in each of its tables is the descriptor's answer, not this reader's:
       // one partition of the table, or the table itself. See EngineRun.relativePathOf.
       val byIdentity = run.tables.map(table =>
-        PrimaryReader.ScopeEntry("", run.database, table, run.partitionSpecOf, businessDate))
+        PrimaryReader.ScopeEntry("", run.database, table, run.partitionSpecOf, businessDate,
+          run.engine, run.runId))
 
       val byPath = run.tables.flatMap { table =>
         pathOf(run, table, location).map(path =>
-          PrimaryReader.ScopeEntry(path, "", "", "", businessDate))
+          PrimaryReader.ScopeEntry(path, "", "", "", businessDate, run.engine, run.runId))
       }
 
       // The run's non-Hive output folder: written by this run, named by this run's configuration.
       val outputs = run.outputDirectories.map(directory =>
-        PrimaryReader.ScopeEntry(PrimaryUtilities.qualifyPath(directory), "", "", "", businessDate))
+        PrimaryReader.ScopeEntry(PrimaryUtilities.qualifyPath(directory), "", "", "", businessDate,
+          run.engine, run.runId))
 
       if (location.isEmpty && !run.isTableGranular)
         log.warn(s"Could not resolve the location of database '${run.database}'; run ${run.runId} " +

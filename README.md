@@ -216,8 +216,28 @@ the local conf — and `localRun/purge/sql/queries.sql.conf` does not exist, whi
 | `purge_inventory` / `purge_catalog` | `InventoryDriver` | the filesystem scan of a scope, and the metastore's view of the same scope |
 | `purge_manifest` | `SimulationDriver`, `MainDriver` | ORC partitioned by `(purge_date, run_id)`: every candidate with its size, age, business date **and where that date came from**, policy, strategy, `decision` and the controls it failed |
 | the HTML report | `SimulationDriver`, `MainDriver` | the control matrix, the counters, the offending objects per rule — what an approver actually reads |
-| `purge_detail` | `MainDriver` in execute mode | one row per object touched, ORC partitioned by `(purge_date, run_id)`: status, bytes freed, `trash_path`, `restore_deadline`, error |
-| `run_history` | every driver that audits | the shared STR run history, `module_name = purge` |
+| `purge_detail` | `MainDriver` in execute mode | one row per object touched, ORC partitioned by `(purge_date, run_id)`: status, bytes freed, `trash_path`, `restore_deadline`, error, and `source_engine` / `source_run_id` — the engine run the object belonged to |
+| `run_history` | every driver that audits | the run history, `module_name = purge`, carrying the purged run ids in `scenarios` |
+
+`purge_detail` and `run_history` live in **`dbpurge`**, the purge engine's own database — never in
+the database being purged. An audit that sits inside its subject is an audit a wide enough purge can
+take with it; `dbpurge` is no engine's output, so nothing an engine-driven scope expands to can
+reach it. Both keep `external.table.purge = FALSE`, so even `DROP TABLE` leaves the ORC behind.
+
+**Following a purge afterwards** — the three ids that answer "what did I remove?":
+
+```sql
+-- by the purge run
+SELECT * FROM dbpurge.purge_detail WHERE run_id = '<purge run id>';
+-- by the TWIST request, across every attempt of it
+SELECT * FROM dbpurge.purge_detail WHERE request_id = 'PRG-2026-000142';
+-- by the ENGINE run that was purged, whatever the engine's granularity
+SELECT * FROM dbpurge.purge_detail WHERE source_run_id = '5bbad7c8-...';
+-- what is still restorable, and until when
+SELECT path, trash_path, restore_deadline FROM dbpurge.purge_detail
+WHERE status IN ('TRASHED','PARTITION_DROPPED','TABLE_DROPPED')
+  AND restore_deadline > current_timestamp();
+```
 
 The manifest carries a **fingerprint** — a SHA-256 over the sorted `(path, size_bytes,
 modification_time)` triples — which the execution re-checks before touching anything.

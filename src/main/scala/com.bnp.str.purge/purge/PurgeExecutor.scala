@@ -339,6 +339,11 @@ class PurgeExecutor()(implicit sparkSession: SparkSession, conf: Config) {
     PurgeDetailRecord(
       runId = runId,
       requestId = stringOf(row, "request_id"),
+      // Which engine run this object belonged to, carried from the scope through the manifest so
+      // that `purge_detail` can be filtered by it directly. A table-granular row has no partition
+      // spec to recover it from.
+      sourceEngine = stringOf(row, "source_engine"),
+      sourceRunId = stringOf(row, "source_run_id"),
       path = stringOf(row, "path"),
       databaseName = stringOf(row, "database_name"),
       tableName = stringOf(row, "table_name"),
@@ -371,7 +376,7 @@ object PurgeExecutor {
   /** The manifest columns the executor reads. Anything else in the manifest is not its business. */
   val MANIFEST_COLUMNS = Seq("path", "request_id", "database_name", "table_name", "partition_spec",
     "is_registered_partition", "is_registered_table", "strategy", "decision", "size_bytes",
-    "num_files", "modification_time")
+    "num_files", "modification_time", "source_engine", "source_run_id")
 
   val STATUS_DELETED = "DELETED"
   val STATUS_TRASHED = "TRASHED"
@@ -415,6 +420,8 @@ object PurgeExecutor {
 /** One object, and what the execution did to it. Persisted as a row of `purge_detail`. */
 final case class PurgeDetailRecord(runId: String,
                                    requestId: String,
+                                   sourceEngine: String,
+                                   sourceRunId: String,
                                    path: String,
                                    databaseName: String,
                                    tableName: String,

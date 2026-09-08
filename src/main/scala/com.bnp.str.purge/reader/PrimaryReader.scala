@@ -155,12 +155,20 @@ object PrimaryReader {
    *                            — an engine run carries its as-of quarter, and that is a truer age for
    *                            run-partitioned output than any date on the files. Empty when the
    *                            selection is just a path someone picked.
+   * @param scope_engine        the engine whose run put this object in scope, when one did.
+   * @param scope_run_id        that run's id — carried all the way to `purge_detail` so every row
+   *                            says which run it belonged to. For a partition-granular engine the
+   *                            id is also in `partition_spec` (`runid=<uuid>`); for a table-granular
+   *                            one it is nowhere else at all, and without this column the only way
+   *                            back from a purged table to its run is `run_history.scenarios`.
    */
   final case class ScopeEntry(scope_path: String,
                               scope_database: String,
                               scope_table: String,
                               scope_partition_spec: String,
-                              scope_business_date: String = "")
+                              scope_business_date: String = "",
+                              scope_engine: String = "",
+                              scope_run_id: String = "")
 
   /** The columns of `run_history` this engine reads; the shared table has more. */
   final case class RunHistoryEntry(run_id: String,

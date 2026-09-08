@@ -160,6 +160,8 @@ object PrimaryView {
        |in_scope AS (
        |  SELECT d.path
        |       , MAX(NULLIF(sc.scope_business_date, '')) AS scope_business_date
+       |       , MAX(NULLIF(sc.scope_engine, ''))        AS scope_engine
+       |       , MAX(NULLIF(sc.scope_run_id, ''))        AS scope_run_id
        |  FROM dated d
        |  JOIN ${PrimaryConstants.VIEW_PURGE_SCOPE} sc
        |    ON (sc.scope_path <> '' AND d.path = sc.scope_path)
@@ -172,6 +174,8 @@ object PrimaryView {
        |scoped AS (
        |  SELECT d.*
        |       , $UDF_BUSINESS_DATE(sc.scope_business_date) AS run_business_date
+       |       , COALESCE(sc.scope_engine, '')              AS source_engine
+       |       , COALESCE(sc.scope_run_id, '')              AS source_run_id
        |       , (sc.path IS NOT NULL)                      AS explicitly_scoped
        |  FROM dated d
        |  LEFT JOIN in_scope sc ON d.path = sc.path
@@ -234,6 +238,11 @@ object PrimaryView {
        |     , owner_group
        |     , business_date
        |     , business_date_source
+       |     -- which engine run put this object in the manifest. For a table-granular engine this is
+       |     -- the ONLY place the run id survives: the table name does not carry it and there is no
+       |     -- partition spec to read it from.
+       |     , source_engine
+       |     , source_run_id
        |     , age_days
        |     , version_group
        |     , version_rank

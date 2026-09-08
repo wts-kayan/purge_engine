@@ -23,6 +23,11 @@ import scala.collection.JavaConverters._
  * The one difference from `run_history`: this table is written AFTER data has been deleted. A
  * failure to write it does not undo the deletion, so the caller logs loudly and the ORC path is the
  * fallback record.
+ *
+ * `source_engine` / `source_run_id` say which engine run each object belonged to. Without them the
+ * question "what happened to run X?" is only answerable at RUN level, through
+ * `run_history.scenarios` — and for a table-granular engine, whose rows carry no partition spec and
+ * whose table names carry no run id, it is not answerable per object at all.
  */
 object PurgeDetailStore {
 
@@ -45,7 +50,12 @@ object PurgeDetailStore {
     StructField("restore_deadline", TimestampType),
     StructField("error_message", StringType),
     StructField("executed_at", TimestampType),
-    StructField("user_launcher", StringType)
+    StructField("user_launcher", StringType),
+    // Appended rather than slotted in beside request_id: a table already registered from an earlier
+    // version keeps its column order, and appending is the one change an ALTER TABLE ADD COLUMNS
+    // can make to it without rewriting anything.
+    StructField("source_engine", StringType),
+    StructField("source_run_id", StringType)
   ))
 
   /** Full write schema: data columns first, then the partition columns LAST. */
@@ -84,7 +94,7 @@ object PurgeDetailStore {
     val rows = records.map(r => Row(
       r.requestId, r.path, r.databaseName, r.tableName, r.partitionSpec, r.strategy, r.status,
       r.bytesFreed, r.numFiles, r.trashPath, r.restoreDeadline.orNull, r.errorMessage,
-      r.executedAt, r.userLauncher, purgeDate, r.runId))
+      r.executedAt, r.userLauncher, r.sourceEngine, r.sourceRunId, purgeDate, r.runId))
     spark.createDataFrame(rows.asJava, schema)
   }
 
